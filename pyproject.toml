@@ -1,0 +1,14 @@
+[project]
+name = "odoo-mcp-server"
+version = "0.1.0"
+description = "MCP server for Odoo ERP — connect any AI agent to your Odoo instance"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp>=2.0",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+odoo-mcp-server = "odoo_mcp_server:main"
