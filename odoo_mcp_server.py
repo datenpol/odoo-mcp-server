@@ -28,6 +28,7 @@ Environment variables:
     ODOO_USER      — Login username               (required)
     ODOO_PASSWORD  — Password for Odoo 17-18      (one of password/api_key required)
     ODOO_API_KEY   — API key for Odoo 19+         (preferred when available)
+    ODOO_READONLY  — Set to "1" or "true" to disable all write operations
 """
 
 from __future__ import annotations
@@ -232,6 +233,18 @@ def _connect_from_env() -> OdooClient:
 
 
 odoo: OdooClient  # set at startup
+READONLY: bool = os.environ.get("ODOO_READONLY", "").lower() in ("1", "true", "yes")
+
+_READONLY_ERROR = json.dumps({
+    "error": "Write operations are disabled. The server is running in read-only mode (ODOO_READONLY=true)."
+})
+
+
+def _check_writable() -> None:
+    """Raise if the server is in read-only mode."""
+    if READONLY:
+        raise PermissionError(_READONLY_ERROR)
+
 
 # ---------------------------------------------------------------------------
 # MCP Server
@@ -336,6 +349,7 @@ def odoo_create(model: str, values: dict) -> str:
     Returns:
         JSON string with the new record ID.
     """
+    _check_writable()
     new_id = odoo.create(model, values)
     return json.dumps({"model": model, "operation": "create", "id": new_id})
 
@@ -352,6 +366,7 @@ def odoo_update(model: str, ids: list[int], values: dict) -> str:
     Returns:
         JSON string confirming the update.
     """
+    _check_writable()
     result = odoo.write(model, ids, values)
     return json.dumps({"model": model, "operation": "update",
                        "ids": ids, "success": result})
@@ -368,6 +383,7 @@ def odoo_delete(model: str, ids: list[int]) -> str:
     Returns:
         JSON string confirming the deletion.
     """
+    _check_writable()
     result = odoo.unlink(model, ids)
     return json.dumps({"model": model, "operation": "delete",
                        "ids": ids, "success": result})
@@ -387,6 +403,7 @@ def odoo_execute(model: str, method: str, ids: list[int] | None = None) -> str:
     Returns:
         JSON string with the method result.
     """
+    _check_writable()
     result = odoo.execute(model, method, ids or [])
     return json.dumps({"model": model, "method": method,
                        "ids": ids, "result": result}, default=str)
@@ -553,9 +570,11 @@ def connection_info() -> str:
 def main() -> None:
     global odoo
     odoo = _connect_from_env()
+    mode = "READ-ONLY mode — write operations are disabled" if READONLY else "read-write mode"
     mcp.instructions = (
-        "Odoo ERP tools. You are connected to "
-        f"{odoo.url} (database: {odoo.database}, Odoo {odoo.version})."
+        f"Odoo ERP tools. You are connected to "
+        f"{odoo.url} (database: {odoo.database}, Odoo {odoo.version}). "
+        f"Running in {mode}."
     )
     mcp.run()
 

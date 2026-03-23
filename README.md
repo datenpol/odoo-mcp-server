@@ -86,6 +86,30 @@ Add to `~/.cursor/mcp.json` or equivalent:
 | `ODOO_USER` | Yes | Login username |
 | `ODOO_PASSWORD` | One of these | Password (Odoo 17-18) |
 | `ODOO_API_KEY` | required | API key (Odoo 19+, preferred) |
+| `ODOO_READONLY` | No | Set to `true` to disable all write operations |
+
+### Read-Only Mode
+
+Set `ODOO_READONLY=true` to disable `create`, `update`, `delete`, and `execute` tools. Useful for safe browsing of production instances:
+
+```json
+{
+  "mcpServers": {
+    "odoo": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "--python", "3.11", "--script", "/path/to/odoo_mcp_server.py"],
+      "env": {
+        "ODOO_URL": "https://production.odoo.com",
+        "ODOO_DB": "prod",
+        "ODOO_USER": "readonly-user",
+        "ODOO_PASSWORD": "secret",
+        "ODOO_READONLY": "true"
+      }
+    }
+  }
+}
+```
 
 ## Available Tools
 
