@@ -4,6 +4,8 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server that 
 
 Supports **Odoo 17-18** (JSON-RPC) and **Odoo 19+** (JSON-2 API) — auto-detects the best protocol.
 
+<video src="https://odoocli.com/odoo-mcp.mp4" width="100%" controls poster="https://odoocli.com/odoo-mcp-poster.jpg"></video>
+
 ## Quick Start
 
 ```bash
