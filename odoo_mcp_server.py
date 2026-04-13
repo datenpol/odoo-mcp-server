@@ -23,12 +23,16 @@ Or configure in your MCP client (e.g. Claude Code, Cursor, OdooCLI):
           ODOO_PASSWORD: "your-password"
 
 Environment variables:
-    ODOO_URL       — Odoo instance URL           (required)
-    ODOO_DB        — Database name                (required)
-    ODOO_USER      — Login username               (required)
-    ODOO_PASSWORD  — Password for Odoo 17-18      (one of password/api_key required)
-    ODOO_API_KEY   — API key for Odoo 19+         (preferred when available)
-    ODOO_READONLY  — Set to "1" or "true" to disable all write operations
+    ODOO_URL        — Odoo instance URL           (required)
+    ODOO_DB         — Database name               (required)
+    ODOO_USER       — Login username              (required)
+    ODOO_PASSWORD   — Password for Odoo 17-18     (one of password/api_key required)
+    ODOO_API_KEY    — API key for Odoo 19+        (preferred when available)
+    ODOO_READONLY   — Set to "0" or "false" to enable write operations.
+                      Read-only mode is ON by default.
+    ODOO_ANONYMIZE  — Set to "0" or "false" to disable anonymisation of sensitive
+                      fields (names, emails, addresses, bank/tax IDs, …) in tool
+                      responses. Anonymisation is ON by default.
 """
 
 from __future__ import annotations
@@ -234,7 +238,8 @@ def _connect_from_env() -> OdooClient:
 
 
 odoo: OdooClient  # set at startup
-READONLY: bool = os.environ.get("ODOO_READONLY", "").lower() in ("1", "true", "yes")
+READONLY: bool = os.environ.get("ODOO_READONLY", "1").lower() not in ("0", "false", "no")
+ANONYMIZE: bool = os.environ.get("ODOO_ANONYMIZE", "1").lower() not in ("0", "false", "no")
 
 _READONLY_ERROR = json.dumps({
     "error": "Write operations are disabled. The server is running in read-only mode (ODOO_READONLY=true)."
@@ -245,6 +250,116 @@ def _check_writable() -> None:
     """Raise if the server is in read-only mode."""
     if READONLY:
         raise PermissionError(_READONLY_ERROR)
+
+
+# ---------------------------------------------------------------------------
+# Anonymisation filter
+# ---------------------------------------------------------------------------
+
+# Sensitive fields per model.  Many2one fields listed here have only their
+# display-name component replaced; the numeric ID is preserved so the LLM can
+# still follow relationships.
+_SENSITIVE_FIELDS: dict[str, list[str]] = {
+    "res.partner": [
+        "name", "email", "phone", "mobile", "fax",
+        "street", "street2",
+    ],
+    "res.users": [
+        "name", "email", "login",
+    ],
+    "hr.employee": [
+        "name", "legal_name",
+        "work_email", "work_phone", "mobile_phone",
+        "private_email", "private_phone", "private_street",
+        "ssnid", "barcode", "pin",
+        "permit_no", "visa_no",
+        "birthday", "place_of_birth",
+        "emergency_contact", "emergency_phone",
+        "private_car_plate",
+        "address_home_id", "bank_account_id", "bank_account_ids",
+    ],
+    "hr.payslip": ["employee_id", "name"],
+    "hr.payslip.line": ["employee_id", "name"],
+    "account.move": ["partner_id", "invoice_partner_display_name"],
+    "res.partner.bank": ["acc_number", "acc_holder_name"],
+    "account.account": ["code"],
+    "account.bank.statement.line": ["partner_name", "account_number"],
+}
+
+# Fields masked on every model regardless of the table above.
+_GLOBAL_SENSITIVE: frozenset[str] = frozenset({    
+    "iban", "bic", "vat", "identification_id",
+})
+
+# Primary-name fields: their token has no field-name suffix.
+_PRIMARY_NAME_FIELDS: frozenset[str] = frozenset({"name", "display_name", "complete_name"})
+
+
+def _mk(model: str) -> str:
+    """'res.partner' → 'res_partner'"""
+    return model.replace(".", "_")
+
+
+def _anon_token(model: str, record_id: Any, field: str) -> str:
+    """Return the anonymised string token for a scalar field value."""
+    base = f"{_mk(model)}_{record_id}"
+    return base if field in _PRIMARY_NAME_FIELDS else f"{base}_{field}"
+
+
+def _mask_field(model: str, field: str, value: Any, record_id: Any) -> Any:
+    """Return the anonymised value for one field of one record."""
+    # --- Global Many2one rules (independent of _SENSITIVE_FIELDS) ----------
+    if field == "employee_id":
+        if isinstance(value, list) and len(value) == 2:
+            ref_id = value[0]
+            return [ref_id, f"hr_employee_{ref_id}"]
+        return value
+
+    if field == "partner_id":
+        if isinstance(value, list) and len(value) == 2:
+            ref_id, display = value[0], value[1]
+            if isinstance(display, str) and "," in display:
+                # "Mustermann, Max" → "Mustermann, res_partner_7"
+                last_name = display.split(",", 1)[0]
+                return [ref_id, f"{last_name}, res_partner_{ref_id}"]
+        return value
+
+    # --- Model-specific + global field rules --------------------------------
+    if field not in _GLOBAL_SENSITIVE and field not in _SENSITIVE_FIELDS.get(model, []):
+        return value
+
+    if value is None or value is False:
+        return value
+
+    # Many2one [id, "display_name"] — replace only the label
+    if isinstance(value, list) and len(value) == 2:
+        ref_id = value[0]
+        return [ref_id, _anon_token(model, record_id, field)]
+
+    return _anon_token(model, record_id, field)
+
+
+def _filter_record(model: str, record: dict) -> dict:
+    """Anonymise all sensitive fields in a single record dict."""
+    record_id = record.get("id", "x")
+    return {
+        field: _mask_field(model, field, value, record_id)
+        for field, value in record.items()
+    }
+
+
+def _filter_output(model: str, json_str: str) -> str:
+    """Post-process a tool's JSON output, anonymising all sensitive fields."""
+    try:
+        data = json.loads(json_str)
+    except (json.JSONDecodeError, TypeError):
+        return json_str
+    if "records" in data and isinstance(data["records"], list):
+        data["records"] = [
+            _filter_record(model, r) if isinstance(r, dict) else r
+            for r in data["records"]
+        ]
+    return json.dumps(data, default=str)
 
 
 # ---------------------------------------------------------------------------
@@ -280,8 +395,9 @@ def odoo_search_read(
     """
     records = odoo.search_read(model, domain=domain, fields=fields,
                                limit=limit, offset=offset, order=order)
-    return json.dumps({"model": model, "count": len(records),
-                       "records": records}, default=str)
+    result = json.dumps({"model": model, "count": len(records),
+                         "records": records}, default=str)
+    return _filter_output(model, result) if ANONYMIZE else result
 
 
 @mcp.tool()
@@ -330,13 +446,14 @@ def odoo_export(
     limit = min(limit, 2000)
     records = odoo.search_read(model, domain=domain, fields=fields,
                                limit=limit, offset=offset, order=order)
-    return json.dumps({
+    result = json.dumps({
         "model": model,
         "count": len(records),
         "offset": offset,
         "next_offset": offset + len(records) if len(records) == limit else None,
         "records": records,
     }, default=str)
+    return _filter_output(model, result) if ANONYMIZE else result
 
 
 @mcp.tool()
@@ -1004,10 +1121,15 @@ def main() -> None:
     global odoo
     odoo = _connect_from_env()
     mode = "READ-ONLY mode — write operations are disabled" if READONLY else "read-write mode"
+    anon_note = (
+        " Sensitive fields (names, emails, addresses, bank/tax IDs, balances) "
+        "are anonymised in tool responses. Set ODOO_ANONYMIZE=0 to disable."
+        if ANONYMIZE else ""
+    )
     mcp.instructions = (
         f"Odoo ERP tools. You are connected to "
         f"{odoo.url} (database: {odoo.database}, Odoo {odoo.version}). "
-        f"Running in {mode}."
+        f"Running in {mode}.{anon_note}"
     )
     mcp.run()
 

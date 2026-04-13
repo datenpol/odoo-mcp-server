@@ -89,6 +89,41 @@ Add to `~/.cursor/mcp.json` or equivalent:
 | `ODOO_PASSWORD` | One of these | Password (Odoo 17-18) |
 | `ODOO_API_KEY` | required | API key (Odoo 19+, preferred) |
 | `ODOO_READONLY` | No | Set to `true` to disable all write operations |
+| `ODOO_ANONYMIZE` | No | Set to `0` or `false` to disable anonymisation (default: **on**) |
+
+### Anonymisation (GDPR / Data Privacy)
+
+By default all tool responses anonymise sensitive fields before they reach the AI model. This protects personal data, business secrets, and other sensitive information from appearing in conversation history or logs.
+
+**What gets anonymised:**
+
+| Category | Fields / Models |
+|---|---|
+| Partner names (persons) | `name`, `email`, `phone`, `mobile`, `fax`, `street` on `res.partner` |
+| User accounts | `name`, `email`, `login` on `res.users` |
+| Employee private data | name, work/private contact details, SSN, passport, bank accounts on `hr.employee` |
+| Payroll | `employee_id` display name on `hr.payslip` / `hr.payslip.line` |
+| Invoices | `partner_id`, `invoice_partner_display_name` on `account.move` |
+| Bank data | `acc_number`, `acc_holder_name` on `res.partner.bank` |
+| Account codes | `code` on `account.account` |
+| Global (all models) | `balance`, `credit`, `debit`, `iban`, `bic`, `vat`, `identification_id` |
+| `employee_id` (any model) | Display name always anonymised |
+| `partner_id` (any model) | First name anonymised if the name contains a comma (private person) |
+
+**Format:** `{model}_{id}` for the primary name, `{model}_{id}_{field}` for other fields.
+Example: `res.partner` id 37 → `name` becomes `res_partner_37`, `email` becomes `res_partner_37_email`.
+
+For `partner_id` with a person: `"Mustermann, Max"` → `"Mustermann, res_partner_7"` (last name stays visible).
+
+To **disable** anonymisation (e.g. for local development):
+
+```json
+{
+  "env": {
+    "ODOO_ANONYMIZE": "0"
+  }
+}
+```
 
 ### Read-Only Mode
 
