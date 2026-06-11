@@ -309,19 +309,16 @@ def _anon_token(model: str, record_id: Any, field: str) -> str:
 def _mask_field(model: str, field: str, value: Any, record_id: Any) -> Any:
     """Return the anonymised value for one field of one record."""
     # --- Global Many2one rules (independent of _SENSITIVE_FIELDS) ----------
-    if field == "employee_id":
+    _M2O_PREFIX = {
+        "employee_id": "hr_employee",
+        "partner_id":  "res_partner",
+        "author_id":   "res_partner",
+        "user_id":     "res_users",
+    }
+    if field in _M2O_PREFIX:
         if isinstance(value, list) and len(value) == 2:
             ref_id = value[0]
-            return [ref_id, f"hr_employee_{ref_id}"]
-        return value
-
-    if field == "partner_id":
-        if isinstance(value, list) and len(value) == 2:
-            ref_id, display = value[0], value[1]
-            if isinstance(display, str) and "," in display:
-                # "Mustermann, Max" → "Mustermann, res_partner_7"
-                last_name = display.split(",", 1)[0]
-                return [ref_id, f"{last_name}, res_partner_{ref_id}"]
+            return [ref_id, f"{_M2O_PREFIX[field]}_{ref_id}"]
         return value
 
     # --- Model-specific + global field rules --------------------------------
