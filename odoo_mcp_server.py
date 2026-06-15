@@ -4,6 +4,7 @@
 # dependencies = [
 #     "fastmcp>=2.0",
 #     "httpx>=0.27",
+#     "python-dotenv>=1.0",
 # ]
 # ///
 """Standalone MCP server exposing Odoo operations as tools.
@@ -42,6 +43,12 @@ import json
 import logging
 import os
 from typing import Any, Optional
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 import httpx
 from fastmcp import FastMCP
