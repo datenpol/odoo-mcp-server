@@ -46,7 +46,7 @@ from typing import Any, Optional
 
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    load_dotenv(find_dotenv(usecwd=True))
 except ImportError:
     pass
 
