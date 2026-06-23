@@ -284,6 +284,8 @@ _SENSITIVE_FIELDS: dict[str, list[str]] = {
         "emergency_contact", "emergency_phone",
         "private_car_plate",
         "address_home_id", "bank_account_id", "bank_account_ids",
+        "marital", "gender",
+        "private_zip", "private_city", "private_state_id", "private_country_id",
     ],
     "hr.payslip": ["employee_id", "name"],
     "hr.payslip.line": ["employee_id", "name"],
@@ -294,8 +296,16 @@ _SENSITIVE_FIELDS: dict[str, list[str]] = {
 }
 
 # Fields masked on every model regardless of the table above.
-_GLOBAL_SENSITIVE: frozenset[str] = frozenset({    
+_GLOBAL_SENSITIVE: frozenset[str] = frozenset({
     "iban", "bic", "vat", "identification_id",
+})
+
+# Binary/image fields that must always be suppressed (set to False) for
+# res.partner, res.users and hr.employee — never passed through to the LLM.
+_IMAGE_MODELS: frozenset[str] = frozenset({"res.partner", "res.users", "hr.employee"})
+_IMAGE_FIELDS: frozenset[str] = frozenset({
+    "image_1920", "image_1024", "image_512", "image_256", "image_128",
+    "avatar_1920", "avatar_1024", "avatar_512", "avatar_256", "avatar_128",
 })
 
 # Primary-name fields: their token has no field-name suffix.
@@ -352,15 +362,37 @@ def _filter_record(model: str, record: dict) -> dict:
     }
 
 
-def _filter_output(model: str, json_str: str) -> str:
-    """Post-process a tool's JSON output, anonymising all sensitive fields."""
+def _strip_images(model: str, record: dict) -> dict:
+    """Always suppress binary image/avatar fields — independent of ANONYMIZE flag.
+
+    These fields contain large base64 blobs that are useless for an LLM and
+    must never be forwarded, even when ODOO_ANONYMIZE=0.
+    """
+    if model not in _IMAGE_MODELS:
+        return record
+    return {
+        field: (False if field in _IMAGE_FIELDS and value not in (None, False) else value)
+        for field, value in record.items()
+    }
+
+
+def _apply_record_filters(model: str, record: dict, anonymize: bool) -> dict:
+    """Apply all per-record transformations in the correct order."""
+    record = _strip_images(model, record)
+    if anonymize:
+        record = _filter_record(model, record)
+    return record
+
+
+def _filter_output(model: str, json_str: str, anonymize: bool = True) -> str:
+    """Post-process a tool's JSON output: strip images + optionally anonymise."""
     try:
         data = json.loads(json_str)
     except (json.JSONDecodeError, TypeError):
         return json_str
     if "records" in data and isinstance(data["records"], list):
         data["records"] = [
-            _filter_record(model, r) if isinstance(r, dict) else r
+            _apply_record_filters(model, r, anonymize) if isinstance(r, dict) else r
             for r in data["records"]
         ]
     return json.dumps(data, default=str)
@@ -401,7 +433,7 @@ def odoo_search_read(
                                limit=limit, offset=offset, order=order)
     result = json.dumps({"model": model, "count": len(records),
                          "records": records}, default=str)
-    return _filter_output(model, result) if ANONYMIZE else result
+    return _filter_output(model, result, anonymize=ANONYMIZE)
 
 
 @mcp.tool()
@@ -457,7 +489,7 @@ def odoo_export(
         "next_offset": offset + len(records) if len(records) == limit else None,
         "records": records,
     }, default=str)
-    return _filter_output(model, result) if ANONYMIZE else result
+    return _filter_output(model, result, anonymize=ANONYMIZE)
 
 
 @mcp.tool()
