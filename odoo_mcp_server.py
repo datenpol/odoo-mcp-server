@@ -29,11 +29,15 @@ Environment variables:
     ODOO_USER       — Login username              (required)
     ODOO_PASSWORD   — Password for Odoo 17-18     (one of password/api_key required)
     ODOO_API_KEY    — API key for Odoo 19+        (preferred when available)
-    ODOO_READONLY   — Set to "0" or "false" to enable write operations.
-                      Read-only mode is ON by default.
-    ODOO_ANONYMIZE  — Set to "0" or "false" to disable anonymisation of sensitive
-                      fields (names, emails, addresses, bank/tax IDs, …) in tool
-                      responses. Anonymisation is ON by default.
+    ODOO_READONLY              — Set to "0" or "false" to enable write operations.
+                                 Read-only mode is ON by default.
+    ODOO_ANONYMIZE             — Set to "0" or "false" to disable anonymisation of
+                                 sensitive fields (names, emails, addresses,
+                                 bank/tax IDs, …) in tool responses.
+                                 Anonymisation is ON by default.
+    ODOO_TASK_DESCRIPTION_WRITE — Set to "1" or "true" to enable writing the
+                                 description field of project tasks. Off by default.
+                                 Works independently of ODOO_READONLY.
 """
 
 from __future__ import annotations
@@ -247,6 +251,7 @@ def _connect_from_env() -> OdooClient:
 odoo: OdooClient  # set at startup
 READONLY: bool = os.environ.get("ODOO_READONLY", "1").lower() not in ("0", "false", "no")
 ANONYMIZE: bool = os.environ.get("ODOO_ANONYMIZE", "1").lower() not in ("0", "false", "no")
+TASK_DESCRIPTION_WRITE: bool = os.environ.get("ODOO_TASK_DESCRIPTION_WRITE", "0").lower() in ("1", "true", "yes")
 
 _READONLY_ERROR = json.dumps({
     "error": "Write operations are disabled. The server is running in read-only mode (ODOO_READONLY=true)."
@@ -541,6 +546,47 @@ def odoo_delete(model: str, ids: list[int]) -> str:
     result = odoo.unlink(model, ids)
     return json.dumps({"model": model, "operation": "delete",
                        "ids": ids, "success": result})
+
+
+@mcp.tool()
+def odoo_task_set_description(task_id: int, description: str) -> str:
+    """Write the description (internal notes / HTML body) of a project task.
+
+    Enabled independently of the global read-only mode via the
+    ODOO_TASK_DESCRIPTION_WRITE environment variable.
+
+    Args:
+        task_id: ID of the project.task record to update.
+        description: New description content. HTML is accepted and preserved
+                     by Odoo; plain text is also fine.
+
+    Returns:
+        JSON string confirming the update or an error message.
+    """
+    if not TASK_DESCRIPTION_WRITE:
+        return json.dumps({
+            "error": (
+                "Writing task descriptions is disabled. "
+                "Set ODOO_TASK_DESCRIPTION_WRITE=1 to enable."
+            )
+        })
+    tasks = odoo.search_read(
+        "project.task",
+        domain=[["id", "=", task_id]],
+        fields=["id", "name"],
+        limit=1,
+    )
+    if not tasks:
+        return json.dumps({"error": f"Task with id={task_id} not found."})
+
+    odoo.write("project.task", [task_id], {"description": description})
+    return json.dumps({
+        "model": "project.task",
+        "operation": "set_description",
+        "task_id": task_id,
+        "task_name": tasks[0].get("name", ""),
+        "success": True,
+    })
 
 
 @mcp.tool()
@@ -1162,10 +1208,14 @@ def main() -> None:
         "are anonymised in tool responses. Set ODOO_ANONYMIZE=0 to disable."
         if ANONYMIZE else ""
     )
+    task_desc_note = (
+        " Task description writing enabled (ODOO_TASK_DESCRIPTION_WRITE=1)."
+        if TASK_DESCRIPTION_WRITE else ""
+    )
     mcp.instructions = (
         f"Odoo ERP tools. You are connected to "
         f"{odoo.url} (database: {odoo.database}, Odoo {odoo.version}). "
-        f"Running in {mode}.{anon_note}"
+        f"Running in {mode}.{anon_note}{task_desc_note}"
     )
     mcp.run()
 
