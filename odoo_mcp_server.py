@@ -21,14 +21,16 @@ Or configure in your MCP client (e.g. Claude Code, Cursor, OdooCLI):
           ODOO_URL: "https://your-instance.odoo.com"
           ODOO_DB: "your-database"
           ODOO_USER: "admin"
-          ODOO_PASSWORD: "your-password"
+          ODOO_API_KEY: "your-api-key"   # preferred for Odoo 14+
+          # ODOO_PASSWORD: "your-password"  # fallback if no API key
 
 Environment variables:
     ODOO_URL        — Odoo instance URL           (required)
     ODOO_DB         — Database name               (required)
     ODOO_USER       — Login username              (required)
-    ODOO_PASSWORD   — Password for Odoo 17-18     (one of password/api_key required)
-    ODOO_API_KEY    — API key for Odoo 19+        (preferred when available)
+    ODOO_PASSWORD   — Password                    (one of password/api_key required)
+    ODOO_API_KEY    — API key for Odoo 14+        (preferred; v19+ uses REST/Bearer,
+                      v14–18 uses it as password via JSON-RPC)
     ODOO_READONLY              — Set to "0" or "false" to enable write operations.
                                  Read-only mode is ON by default.
     ODOO_ANONYMIZE             — Set to "0" or "false" to disable anonymisation of
@@ -69,7 +71,12 @@ class OdooConnectionError(Exception):
 
 
 class OdooClient:
-    """Lightweight Odoo client supporting JSON-RPC (v17-18) and JSON-2 (v19+)."""
+    """Lightweight Odoo client supporting JSON-RPC (v14+) and JSON-2 REST (v19+).
+
+    API keys (ODOO_API_KEY) are supported from Odoo 14 onwards:
+    - v14–18: the key is passed as the password in the standard JSON-RPC call.
+    - v19+:   the new JSON-2 REST API is used with an Authorization: Bearer header.
+    """
 
     def __init__(
         self,
@@ -90,12 +97,18 @@ class OdooClient:
 
     # -- auth ----------------------------------------------------------------
 
+    @property
+    def _credential(self) -> str:
+        """The credential to use for JSON-RPC calls: api_key takes priority over password."""
+        return self.api_key or self.password or ""
+
     def authenticate(self) -> int:
         self.version = self._detect_version()
 
         if self.api_key and self._is_v19_plus():
             self.uid = self._auth_json2()
         else:
+            # v14–18: api_key is passed as the password via JSON-RPC
             self.uid = self._auth_jsonrpc()
 
         if not self.uid:
@@ -127,7 +140,7 @@ class OdooClient:
             result = self._jsonrpc(
                 f"{self.url}/jsonrpc", "call",
                 service="common", method="authenticate",
-                args=[self.database, self.username, self.password or "", {}],
+                args=[self.database, self.username, self._credential, {}],
             )
             return result if isinstance(result, int) else None
         except Exception as exc:
@@ -160,7 +173,7 @@ class OdooClient:
         return self._jsonrpc(
             f"{self.url}/jsonrpc", "call",
             service="object", method="execute_kw",
-            args=[self.database, self.uid, self.password or "",
+            args=[self.database, self.uid, self._credential,
                   model, method, list(args), kwargs],
         )
 
@@ -235,11 +248,11 @@ def _connect_from_env() -> OdooClient:
     if not all([url, db, user]):
         raise SystemExit(
             "Set ODOO_URL, ODOO_DB, and ODOO_USER environment variables.\n"
-            "Also set ODOO_PASSWORD (v17-18) or ODOO_API_KEY (v19+)."
+            "Also set ODOO_API_KEY (Odoo 14+, preferred) or ODOO_PASSWORD."
         )
     if not password and not api_key:
         raise SystemExit(
-            "Set ODOO_PASSWORD (for Odoo 17-18) or ODOO_API_KEY (for Odoo 19+)."
+            "Set ODOO_API_KEY (Odoo 14+, preferred) or ODOO_PASSWORD."
         )
 
     client = OdooClient(url=url, database=db, username=user,
