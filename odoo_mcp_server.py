@@ -26,11 +26,21 @@ Or configure in your MCP client (e.g. Claude Code, Cursor, OdooCLI):
 
 Environment variables:
     ODOO_URL        — Odoo instance URL           (required)
-    ODOO_DB         — Database name               (required)
-    ODOO_USER       — Login username              (required)
+    ODOO_DB         — Database name               (required for JSON-RPC/password;
+                      optional with the JSON-2 API — only needed when several
+                      databases share one domain)
+    ODOO_USER       — Login username              (required for JSON-RPC/password;
+                      optional with the JSON-2 API — the API key identifies the
+                      user, login is only used to resolve the uid for reference)
     ODOO_PASSWORD   — Password                    (one of password/api_key required)
-    ODOO_API_KEY    — API key for Odoo 14+        (preferred; v19+ uses REST/Bearer,
-                      v14–18 uses it as password via JSON-RPC)
+    ODOO_API_KEY    — API key for Odoo 14+        (preferred; v19+ uses the JSON-2
+                      API with Authorization: Bearer, v14–18 use it as the
+                      password via JSON-RPC)
+    ODOO_FORCE_JSON2           — Set to "1" to force the Odoo 19 JSON-2 API even
+                                 when the server version cannot be detected
+                                 (e.g. JSON-RPC disabled). Requires ODOO_API_KEY.
+    ODOO_LOG_LEVEL             — Log level for server logs on stderr
+                                 (e.g. DEBUG, INFO, WARNING). Defaults to INFO.
     ODOO_READONLY              — Set to "0" or "false" to enable write operations.
                                  Read-only mode is ON by default.
     ODOO_ANONYMIZE             — Set to "0" or "false" to disable anonymisation of
@@ -48,6 +58,7 @@ import ast
 import json
 import logging
 import os
+import sys
 from typing import Any, Optional
 
 try:
@@ -59,6 +70,11 @@ except ImportError:
 import httpx
 from fastmcp import FastMCP
 
+logging.basicConfig(
+    level=os.environ.get("ODOO_LOG_LEVEL", "INFO").upper(),
+    stream=sys.stderr,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -75,24 +91,34 @@ class OdooClient:
 
     API keys (ODOO_API_KEY) are supported from Odoo 14 onwards:
     - v14–18: the key is passed as the password in the standard JSON-RPC call.
-    - v19+:   the new JSON-2 REST API is used with an Authorization: Bearer header.
+    - v19+:   the new JSON-2 API is used (POST /json/2/<model>/<method> with an
+              ``Authorization: Bearer <key>`` header and named arguments).
     """
+
+    # JSON-2 requires named arguments; these methods take a leading ``domain``.
+    _JSON2_DOMAIN_METHODS = {
+        "search", "search_read", "search_count", "search_fetch", "name_search",
+    }
 
     def __init__(
         self,
         url: str,
         database: str,
-        username: str,
+        username: str = "",
         password: Optional[str] = None,
         api_key: Optional[str] = None,
+        force_json2: bool = False,
     ):
         self.url = url.rstrip("/")
         self.database = database
         self.username = username
         self.password = password
         self.api_key = api_key
+        self.force_json2 = force_json2
         self.uid: Optional[int] = None
         self.version: Optional[str] = None
+        self._use_json2 = False
+        self._authenticated = False
         self._http = httpx.Client(timeout=30.0)
 
     # -- auth ----------------------------------------------------------------
@@ -102,19 +128,46 @@ class OdooClient:
         """The credential to use for JSON-RPC calls: api_key takes priority over password."""
         return self.api_key or self.password or ""
 
+    def _json2_headers(self) -> dict[str, str]:
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        # Only needed when several databases share one domain; harmless otherwise.
+        if self.database:
+            headers["X-Odoo-Database"] = self.database
+        return headers
+
     def authenticate(self) -> int:
         self.version = self._detect_version()
 
-        if self.api_key and self._is_v19_plus():
-            self.uid = self._auth_json2()
-        else:
-            # v14–18: api_key is passed as the password via JSON-RPC
-            self.uid = self._auth_jsonrpc()
+        # Use JSON-2 when we have an API key and either the server is v19+, the
+        # user forced it, or version detection failed (JSON-RPC may be disabled).
+        want_json2 = bool(self.api_key) and (
+            self.force_json2 or self._is_v19_plus() or self.version == "unknown"
+        )
+
+        logger.info(
+            "Detected Odoo version: %s (using %s%s)",
+            self.version,
+            "JSON-2 API" if want_json2 else "JSON-RPC",
+            " [forced]" if want_json2 and self.force_json2 else "",
+        )
+
+        if want_json2:
+            if self._auth_json2():
+                self._use_json2 = True
+                self._authenticated = True
+                logger.info("Authenticated via JSON-2 API (uid=%s).", self.uid)
+                return self.uid or 0
+            logger.warning("JSON-2 auth failed; falling back to JSON-RPC.")
+
+        # v14–18 (or fallback): api_key is passed as the password via JSON-RPC.
+        self.uid = self._auth_jsonrpc()
 
         if not self.uid:
             raise OdooConnectionError(
-                f"Authentication failed for {self.username}@{self.url}/{self.database}"
+                f"Authentication failed for {self.username or '<api-key>'}"
+                f"@{self.url}/{self.database}"
             )
+        self._authenticated = True
         return self.uid
 
     def _detect_version(self) -> str:
@@ -147,25 +200,47 @@ class OdooClient:
             logger.error("JSON-RPC auth failed: %s", exc)
             return None
 
-    def _auth_json2(self) -> Optional[int]:
+    def _auth_json2(self) -> bool:
+        # JSON-2 has no dedicated login endpoint and needs no username: the API
+        # key alone identifies the user. Any authorised call validates the key.
+        # If a username (login) is configured, resolve the uid for reference.
         try:
-            resp = self._http.get(
-                f"{self.url}/api/res.users/whoami",
-                headers={"Authorization": f"Bearer {self.api_key}"},
+            if self.username:
+                resp = self._http.post(
+                    f"{self.url}/json/2/res.users/search_read",
+                    json={"domain": [["login", "=", self.username]],
+                          "fields": ["id"], "limit": 1},
+                    headers=self._json2_headers(),
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                if isinstance(data, list) and data:
+                    self.uid = data[0].get("id")
+                else:
+                    logger.warning(
+                        "JSON-2 auth: login %r not found (API key is valid).",
+                        self.username,
+                    )
+                return True
+
+            # No username configured: just confirm the key is authorised.
+            resp = self._http.post(
+                f"{self.url}/json/2/res.users/search_count",
+                json={"domain": []},
+                headers=self._json2_headers(),
             )
             resp.raise_for_status()
-            data = resp.json()
-            return data.get("uid") or data.get("id")
+            return True
         except Exception as exc:
             logger.error("JSON-2 auth failed: %s", exc)
-            return None
+            return False
 
     # -- execute -------------------------------------------------------------
 
     def execute(self, model: str, method: str, *args: Any, **kwargs: Any) -> Any:
-        if self.uid is None:
+        if not self._authenticated:
             raise OdooConnectionError("Not authenticated.")
-        if self._is_v19_plus() and self.api_key:
+        if self._use_json2:
             return self._exec_json2(model, method, *args, **kwargs)
         return self._exec_jsonrpc(model, method, *args, **kwargs)
 
@@ -178,18 +253,39 @@ class OdooClient:
         )
 
     def _exec_json2(self, model: str, method: str, *args: Any, **kwargs: Any) -> Any:
-        payload: dict[str, Any] = {}
-        if args:
-            payload["args"] = list(args)
-        if kwargs:
-            payload.update(kwargs)
+        body = self._json2_body(method, list(args), kwargs)
         resp = self._http.post(
-            f"{self.url}/api/{model}/{method}",
-            json=payload,
-            headers={"Authorization": f"Bearer {self.api_key}"},
+            f"{self.url}/json/2/{model}/{method}",
+            json=body,
+            headers=self._json2_headers(),
         )
         resp.raise_for_status()
         return resp.json()
+
+    def _json2_body(self, method: str, args: list, kwargs: dict) -> dict[str, Any]:
+        """Translate positional args into the named arguments JSON-2 requires."""
+        body: dict[str, Any] = dict(kwargs)
+        if not args:
+            return body
+
+        if method in self._JSON2_DOMAIN_METHODS:
+            body.setdefault("domain", args[0])
+        elif method == "create":
+            body.setdefault("vals_list", args[0])
+        elif method == "write":
+            body.setdefault("ids", args[0])
+            if len(args) > 1:
+                body.setdefault("vals", args[1])
+        elif method == "read":
+            body.setdefault("ids", args[0])
+            if len(args) > 1:
+                body.setdefault("fields", args[1])
+        elif method == "get_views":
+            body.setdefault("views", args[0])
+        else:
+            # Default: a method acting on records — the first arg is the id list.
+            body.setdefault("ids", args[0])
+        return body
 
     # -- convenience ---------------------------------------------------------
 
@@ -245,18 +341,29 @@ def _connect_from_env() -> OdooClient:
     password = os.environ.get("ODOO_PASSWORD")
     api_key = os.environ.get("ODOO_API_KEY")
 
-    if not all([url, db, user]):
+    if not url:
         raise SystemExit(
-            "Set ODOO_URL, ODOO_DB, and ODOO_USER environment variables.\n"
+            "Set the ODOO_URL environment variable.\n"
             "Also set ODOO_API_KEY (Odoo 14+, preferred) or ODOO_PASSWORD."
         )
     if not password and not api_key:
         raise SystemExit(
             "Set ODOO_API_KEY (Odoo 14+, preferred) or ODOO_PASSWORD."
         )
+    # With the JSON-2 API (Odoo 19+) the API key alone identifies the user, so
+    # ODOO_USER and ODOO_DB are optional. The JSON-RPC path (password auth on
+    # v14–18) still needs both a login and a database.
+    if not api_key and (not user or not db):
+        raise SystemExit(
+            "Set ODOO_USER and ODOO_DB (required for password/JSON-RPC "
+            "authentication)."
+        )
+
+    force_json2 = os.environ.get("ODOO_FORCE_JSON2", "0").lower() in ("1", "true", "yes")
 
     client = OdooClient(url=url, database=db, username=user,
-                        password=password, api_key=api_key)
+                        password=password, api_key=api_key,
+                        force_json2=force_json2)
     client.authenticate()
     return client
 
