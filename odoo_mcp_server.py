@@ -50,6 +50,11 @@ Environment variables:
     ODOO_TASK_DESCRIPTION_WRITE — Set to "1" or "true" to enable writing the
                                  description field of project tasks. Off by default.
                                  Works independently of ODOO_READONLY.
+    ODOO_KNOWLEDGE_WRITE — Set to "1" or "true" to enable writing the body of
+                       knowledge articles. Off by default.
+                       Works independently of ODOO_READONLY.
+                       Write access is further restricted to articles created
+                       by the authenticated MCP user.
 """
 
 from __future__ import annotations
@@ -372,6 +377,7 @@ odoo: OdooClient  # set at startup
 READONLY: bool = os.environ.get("ODOO_READONLY", "1").lower() not in ("0", "false", "no")
 ANONYMIZE: bool = os.environ.get("ODOO_ANONYMIZE", "1").lower() not in ("0", "false", "no")
 TASK_DESCRIPTION_WRITE: bool = os.environ.get("ODOO_TASK_DESCRIPTION_WRITE", "0").lower() in ("1", "true", "yes")
+KNOWLEDGE_WRITE: bool = os.environ.get("ODOO_KNOWLEDGE_WRITE", "0").lower() in ("1", "true", "yes")
 
 _READONLY_ERROR = json.dumps({
     "error": "Write operations are disabled. The server is running in read-only mode (ODOO_READONLY=true)."
@@ -530,13 +536,40 @@ def _filter_output(model: str, json_str: str, anonymize: bool = True) -> str:
 mcp = FastMCP("odoo")
 
 
+# ---------------------------------------------------------------------------
+# Parameter coercion helpers
+# ---------------------------------------------------------------------------
+# Some MCP clients (e.g. Claude Code / Cursor) serialise list/array arguments
+# as JSON strings instead of native JSON arrays.  FastMCP validates parameters
+# strictly before the tool body runs, so we declare the types as
+# ``list | str | None`` and coerce inside the function using these helpers.
+
+
+def _coerce_list(value: list | str | None) -> list | None:
+    """Accept a list or a JSON/Python-literal string representation of a list."""
+    if value is None or isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = ast.literal_eval(text)
+        if not isinstance(parsed, list):
+            raise ValueError(f"Expected a list, got {type(parsed).__name__}: {text!r}")
+        return parsed
+    raise TypeError(f"Cannot coerce {type(value).__name__!r} to list")
+
+
 # -- Tools -------------------------------------------------------------------
 
 @mcp.tool()
 def odoo_search_read(
     model: str,
-    domain: list | None = None,
-    fields: list[str] | None = None,
+    domain: list | str | None = None,
+    fields: list | str | None = None,
     limit: int = 20,
     offset: int = 0,
     order: str | None = None,
@@ -554,6 +587,8 @@ def odoo_search_read(
     Returns:
         JSON string with matching records.
     """
+    domain = _coerce_list(domain)
+    fields = _coerce_list(fields)
     records = odoo.search_read(model, domain=domain, fields=fields,
                                limit=limit, offset=offset, order=order)
     result = json.dumps({"model": model, "count": len(records),
@@ -562,7 +597,7 @@ def odoo_search_read(
 
 
 @mcp.tool()
-def odoo_search_count(model: str, domain: list | None = None) -> str:
+def odoo_search_count(model: str, domain: list | str | None = None) -> str:
     """Count records matching a domain filter without fetching data.
 
     Use this before a large export to know how many records exist.
@@ -574,6 +609,7 @@ def odoo_search_count(model: str, domain: list | None = None) -> str:
     Returns:
         JSON string with the total count.
     """
+    domain = _coerce_list(domain)
     total = odoo.search_count(model, domain=domain)
     return json.dumps({"model": model, "count": total})
 
@@ -581,8 +617,8 @@ def odoo_search_count(model: str, domain: list | None = None) -> str:
 @mcp.tool()
 def odoo_export(
     model: str,
-    domain: list | None = None,
-    fields: list[str] | None = None,
+    domain: list | str | None = None,
+    fields: list | str | None = None,
     limit: int = 500,
     offset: int = 0,
     order: str | None = None,
@@ -604,6 +640,8 @@ def odoo_export(
     Returns:
         JSON string with records, count returned, and offset for next page.
     """
+    domain = _coerce_list(domain)
+    fields = _coerce_list(fields)
     limit = min(limit, 2000)
     records = odoo.search_read(model, domain=domain, fields=fields,
                                limit=limit, offset=offset, order=order)
@@ -634,7 +672,7 @@ def odoo_create(model: str, values: dict) -> str:
 
 
 @mcp.tool()
-def odoo_update(model: str, ids: list[int], values: dict) -> str:
+def odoo_update(model: str, ids: list | str, values: dict) -> str:
     """Update existing records in an Odoo model.
 
     Args:
@@ -646,13 +684,14 @@ def odoo_update(model: str, ids: list[int], values: dict) -> str:
         JSON string confirming the update.
     """
     _check_writable()
+    ids = _coerce_list(ids)
     result = odoo.write(model, ids, values)
     return json.dumps({"model": model, "operation": "update",
                        "ids": ids, "success": result})
 
 
 @mcp.tool()
-def odoo_delete(model: str, ids: list[int]) -> str:
+def odoo_delete(model: str, ids: list | str) -> str:
     """Delete records from an Odoo model.
 
     Args:
@@ -663,6 +702,7 @@ def odoo_delete(model: str, ids: list[int]) -> str:
         JSON string confirming the deletion.
     """
     _check_writable()
+    ids = _coerce_list(ids)
     result = odoo.unlink(model, ids)
     return json.dumps({"model": model, "operation": "delete",
                        "ids": ids, "success": result})
@@ -710,7 +750,91 @@ def odoo_task_set_description(task_id: int, description: str) -> str:
 
 
 @mcp.tool()
-def odoo_execute(model: str, method: str, ids: list[int] | None = None) -> str:
+def odoo_knowledge_set_body(
+    article_id: int,
+    body: str | None = None,
+    body_file: str | None = None,
+) -> str:
+    """Write the body (HTML content) of a knowledge article.
+
+    Enabled independently of the global read-only mode via the
+    ODOO_KNOWLEDGE_WRITE environment variable.
+
+    Write access is restricted to articles created by the authenticated
+    MCP user (create_uid must match the connected user's uid).
+
+    Provide exactly one of body or body_file.
+
+    Args:
+        article_id: ID of the knowledge.article record to update.
+        body: New body content inline. HTML is accepted and preserved by Odoo;
+              plain text is also fine. Mutually exclusive with body_file.
+        body_file: Absolute or relative path to an HTML (or text) file whose
+                   contents become the article body. Mutually exclusive with body.
+
+    Returns:
+        JSON string confirming the update or an error message.
+    """
+    if not KNOWLEDGE_WRITE:
+        return json.dumps({
+            "error": (
+                "Writing knowledge article bodies is disabled. "
+                "Set ODOO_KNOWLEDGE_WRITE=1 to enable."
+            )
+        })
+
+    if (body is None) == (body_file is None):
+        return json.dumps({
+            "error": "Provide exactly one of 'body' or 'body_file'."
+        })
+
+    if body_file is not None:
+        path = os.path.expanduser(body_file)
+        if not os.path.isfile(path):
+            return json.dumps({"error": f"File not found: {body_file}"})
+        try:
+            with open(path, encoding="utf-8") as f:
+                body = f.read()
+        except OSError as exc:
+            return json.dumps({"error": f"Failed to read file '{body_file}': {exc}"})
+
+    articles = odoo.search_read(
+        "knowledge.article",
+        domain=[["id", "=", article_id]],
+        fields=["id", "name", "create_uid"],
+        limit=1,
+    )
+    if not articles:
+        return json.dumps({"error": f"Article with id={article_id} not found."})
+
+    article = articles[0]
+    create_uid_val = article.get("create_uid")
+    # create_uid is returned as [id, display_name] for Many2one fields
+    creator_id = create_uid_val[0] if isinstance(create_uid_val, list) else create_uid_val
+    if creator_id != odoo.uid:
+        return json.dumps({
+            "error": (
+                f"Permission denied: you are not the creator of article {article_id}. "
+                f"Only the original author (uid={creator_id}) may edit the body."
+            )
+        })
+
+    odoo.write("knowledge.article", [article_id], {"body": body})
+    result: dict[str, Any] = {
+        "model": "knowledge.article",
+        "operation": "set_body",
+        "article_id": article_id,
+        "article_name": article.get("name", ""),
+        "success": True,
+    }
+    if body_file is not None:
+        result["body_file"] = body_file
+        result["body_length"] = len(body or "")
+    return json.dumps(result)
+
+
+@mcp.tool()
+def odoo_execute(model: str, method: str, ids: list | str | None = None) -> str:
     """Execute any model method (action) on Odoo records.
 
     Use this for workflow actions like action_confirm, action_post, etc.
@@ -724,6 +848,7 @@ def odoo_execute(model: str, method: str, ids: list[int] | None = None) -> str:
         JSON string with the method result.
     """
     _check_writable()
+    ids = _coerce_list(ids)
     result = odoo.execute(model, method, ids or [])
     return json.dumps({"model": model, "method": method,
                        "ids": ids, "result": result}, default=str)
@@ -755,7 +880,7 @@ def odoo_list_models(keyword: str = "") -> str:
 
 
 @mcp.tool()
-def odoo_get_fields(model: str, attributes: list[str] | None = None) -> str:
+def odoo_get_fields(model: str, attributes: list | str | None = None) -> str:
     """Get field definitions for an Odoo model.
 
     Useful for discovering what fields a model has before reading/writing.
@@ -768,6 +893,7 @@ def odoo_get_fields(model: str, attributes: list[str] | None = None) -> str:
     Returns:
         JSON string with field metadata.
     """
+    attributes = _coerce_list(attributes)
     attrs = attributes or ["string", "type", "required", "readonly", "help"]
     result = odoo.execute(model, "fields_get", attributes=attrs)
     return json.dumps({"model": model, "fields": result}, default=str)
@@ -1332,10 +1458,14 @@ def main() -> None:
         " Task description writing enabled (ODOO_TASK_DESCRIPTION_WRITE=1)."
         if TASK_DESCRIPTION_WRITE else ""
     )
+    knowledge_note = (
+        " Knowledge article body writing enabled (ODOO_KNOWLEDGE_WRITE=1)."
+        if KNOWLEDGE_WRITE else ""
+    )
     mcp.instructions = (
         f"Odoo ERP tools. You are connected to "
         f"{odoo.url} (database: {odoo.database}, Odoo {odoo.version}). "
-        f"Running in {mode}.{anon_note}{task_desc_note}"
+        f"Running in {mode}.{anon_note}{task_desc_note}{knowledge_note}"
     )
     mcp.run()
 
